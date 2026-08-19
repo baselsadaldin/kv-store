@@ -44,15 +44,35 @@ func randomElectionTimeout() time.Duration {
 
 // Node holds one Raft node's role and state and is safe for concurrent use.
 type Node struct {
-	mu         sync.Mutex
-	id         string
-	peers      []string
-	role       Role
-	state      PersistentState
-	log        *Log
-	statePath  string // empty means "in-memory only, don't persist" (see NewNode vs Open)
-	resetTimer chan struct{}
-	stop       chan struct{}
+	mu          sync.Mutex
+	id          string
+	peers       []string
+	role        Role
+	state       PersistentState
+	log         *Log
+	statePath   string // empty means "in-memory only, don't persist" (see NewNode vs Open)
+	resetTimer  chan struct{}
+	stop        chan struct{}
+	commitIndex int // highest log index known to be committed; volatile, rebuilt on restart, not persisted
+	lastApplied int // highest log index applied to the state machine via apply; volatile, always <= commitIndex
+	apply       Applier
+}
+
+// Applier applies a committed command to the underlying state machine —
+// normally store.Set/store.Delete. It's injected rather than Node holding a
+// concrete *store.Store directly, so Raft logic stays testable without a
+// real store; the real wiring to store.Store happens where a Node is
+// constructed for actual use.
+type Applier func(Command) error
+
+// SetApplier registers the function used to apply newly committed log
+// entries to the state machine (see applyCommittedLocked). Until this is
+// called, commitIndex still advances correctly, but nothing gets applied —
+// fine for tests that only care about consensus, not storage.
+func (n *Node) SetApplier(apply Applier) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.apply = apply
 }
 
 // NewNode creates a Node starting as a Follower with an empty log and zero
@@ -116,6 +136,76 @@ func (n *Node) HandleRequestVoteRPC(args RequestVoteArgs) RequestVoteReply {
 	}
 	n.state = newState
 	return reply
+}
+
+// HandleAppendEntriesRPC applies an incoming AppendEntries RPC to the node:
+// it runs the decision logic in HandleAppendEntries (which mutates n.log
+// directly) under the node's lock, and for a node opened with Open, durably
+// saves any resulting state change BEFORE returning.
+//
+// Unlike a RequestVote reply, any AppendEntries carrying a term at least as
+// current as this node's own is treated as proof of a legitimate Leader —
+// even if the consistency check fails and Success comes back false (that
+// just means the logs need reconciling, not that the sender isn't really
+// the Leader). So on any non-stale request, the node steps down to Follower
+// (a Candidate must stop competing once it learns someone else already won)
+// and resets the election timer via ResetElectionTimer, so Run's background
+// loop knows a real Leader is alive and doesn't call a needless election.
+//
+// Only once the request succeeds does the node advance its own commitIndex
+// toward args.LeaderCommit, capped at how much log it actually has.
+func (n *Node) HandleAppendEntriesRPC(args AppendEntriesArgs) AppendEntriesReply {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	newState, reply := HandleAppendEntries(n.state, n.log, args)
+
+	if args.Term >= n.state.CurrentTerm {
+		n.role = Follower
+		n.ResetElectionTimer()
+	}
+
+	if newState != n.state && n.statePath != "" {
+		if err := SaveState(n.statePath, newState); err != nil {
+			return AppendEntriesReply{Term: n.state.CurrentTerm, Success: false}
+		}
+	}
+	n.state = newState
+
+	if reply.Success {
+		if args.LeaderCommit > n.commitIndex {
+			n.commitIndex = args.LeaderCommit
+			if n.commitIndex > n.log.LastIndex() {
+				n.commitIndex = n.log.LastIndex()
+			}
+		}
+		n.applyCommittedLocked()
+	}
+
+	return reply
+}
+
+// applyCommittedLocked applies every log entry between lastApplied and
+// commitIndex, in order, via the injected Applier. The caller must already
+// hold n.mu. It's a no-op if no Applier has been set (see SetApplier). If
+// applying an entry fails, it stops there without advancing lastApplied
+// past it, so the same entry gets retried the next time this runs (e.g. on
+// the next heartbeat) rather than being silently skipped.
+func (n *Node) applyCommittedLocked() {
+	if n.apply == nil {
+		return
+	}
+	for n.lastApplied < n.commitIndex {
+		next := n.lastApplied + 1
+		entry, ok := n.log.Get(next)
+		if !ok {
+			return // shouldn't happen if commitIndex was capped correctly
+		}
+		if err := n.apply(entry.Command); err != nil {
+			return
+		}
+		n.lastApplied = next
+	}
 }
 
 // RunElection drives one full election attempt: transitions the node to

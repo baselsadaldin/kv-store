@@ -59,14 +59,28 @@ double vote in one term; and `Node.Run` is the background election-timeout
 loop (waits for a randomized timeout, starts an election unless reset via
 `ResetElectionTimer` or already `Leader`, stoppable via `Stop`).
 `HandleRequestVoteRPC` also steps a node down to Follower if an incoming
-request reveals a higher term, even from a stale Leader. Not yet built:
-`AppendEntries`/log replication (including the Leader's own heartbeat
-sending, which is what would call `ResetElectionTimer` on Followers in
-practice — so a live multi-node election doesn't fully settle into a
-stable Leader yet), and wiring committed entries through to
-`store.Set`/`store.Delete`.
+request reveals a higher term, even from a stale Leader. Also now built:
+`HandleAppendEntries` (the receiving side of replication — term check,
+`PrevLogIndex`/`PrevLogTerm` consistency check, conflict truncation via
+`Log.TruncateFrom`, idempotent on retry) and `Node.HandleAppendEntriesRPC`,
+which wraps it with persistence, steps a Candidate down to Follower on any
+non-stale request (recognizing a legitimate Leader even when the
+consistency check itself fails), calls `ResetElectionTimer` for real now,
+and advances `commitIndex` toward `args.LeaderCommit` (capped at how much
+log is actually present); `Node.SetApplier`/`applyCommittedLocked` then
+walk `lastApplied` up to `commitIndex`, calling an injected `Applier`
+(normally `store.Set`/`store.Delete`, but decoupled the same way
+`RequestVoteSender` decouples election logic from real networking) —
+retrying the same entry on failure rather than skipping it. Not yet built:
+real transport for `AppendEntries` (only `RequestVote` has one so far), the
+Leader's own side of replication (periodic heartbeat sending, per-peer
+`nextIndex`/`matchIndex`, majority-based commit-index advancement —
+`CountVotes`'s log-entry-flavored counterpart), accepting a new client
+write on the Leader, and wiring any of this into `cmd/kvstore` as an
+actual runnable multi-node cluster.
 
-Next up: continuing stage 3 — `AppendEntries` and log replication.
+Next up: continuing stage 3 — the Leader's replication loop, then wiring a
+live cluster.
 
 ## Conventions
 
