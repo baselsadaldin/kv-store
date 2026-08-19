@@ -24,7 +24,7 @@ to demonstrate systems programming and distributed systems fundamentals.
 
 ## Status
 
-Stages 1-2 complete.
+Stages 1-2 complete, stage 3 (Raft) in progress.
 
 Stage 1: in-memory store with a write-ahead log for persistence: durable
 Set/Delete (fsync on every write), crash recovery from torn writes on
@@ -38,20 +38,46 @@ Server handles each connection on its own goroutine against one shared
 `*store.Store`. See `server/server.go` for the line protocol
 (SET/GET/DELETE/KEYS/COMPACT in, OK/VALUE/NIL/ERR/KEY.../END out).
 
-Next up: Stage 3, Raft-based consensus.
+Stage 3 (in progress): Raft consensus, being built incrementally in a new
+`raft` package, deliberately kept independent of networking so each piece
+is unit-testable in isolation before any TCP is involved. So far:
+`PersistentState` (durable `currentTerm`/`votedFor`, same write-temp-file +
+atomic-rename crash safety as `store`'s log compaction); an in-memory `Log`
+of term-tagged entries (`Append`/`Get`/`LastIndex`/`LastTerm`/
+`TruncateFrom`); `HandleRequestVote` (the receiving side of an election —
+term/vote/log-up-to-date checks); `StartElection` and `CountVotes` (the
+candidate side — becoming a candidate and tallying replies); and `Node`,
+which ties those together into `RunElection` (fans a `RequestVote` out to
+peers via an injected `RequestVoteSender` function and transitions
+role/state on the result). Not yet built: real peer-to-peer transport (a
+separate port from the client protocol, using `encoding/gob` — decided but
+not implemented), the background timer loop that actually triggers
+elections during normal operation, `AppendEntries`/log replication, and
+wiring committed entries through to `store.Set`/`store.Delete`.
+
+Next up: continuing stage 3 — transport, then `AppendEntries`.
 
 ## Conventions
 
 - Package layout: `store/` holds the storage engine (`store.go`) and WAL
   persistence (`wal.go`); `server/` holds the TCP protocol server
-  (`server.go`); `cmd/kvstore` is the server entrypoint, `cmd/kvcli` the
-  network client.
+  (`server.go`); `raft/` holds Raft consensus (`state.go` persistent
+  term/vote, `log.go` the in-memory entry log, `election.go`/`candidate.go`
+  the vote request/grant/tally logic, `node.go` the `Node` type tying it
+  together); `cmd/kvstore` is the server entrypoint, `cmd/kvcli` the network
+  client.
 - Testing: table-free, one test function per behavior, in `_test.go` files
   next to the code under test (`store_test.go`, `wal_test.go`,
-  `server_test.go`). Concurrency is tested by racing goroutines through the
-  public API (see `TestConcurrentAccess`, `TestConcurrentClients`) — run with
-  `go test -race` when touching locking (requires cgo; not available in every
-  environment, e.g. this Windows dev box without a C toolchain).
+  `server_test.go`, and the `raft` package's `*_test.go` files). Concurrency
+  is tested by racing goroutines through the public API (see
+  `TestConcurrentAccess`, `TestConcurrentClients`) — run with `go test -race`
+  when touching locking (requires cgo; not available in every environment,
+  e.g. this Windows dev box without a C toolchain).
+- Raft is being built with networking deliberately factored out: functions
+  like `HandleRequestVote`/`StartElection`/`CountVotes` are pure (no I/O),
+  and `Node.RunElection` takes a `RequestVoteSender` function instead of a
+  concrete network client, so election logic is fully unit-testable with a
+  fake transport before any real TCP code exists.
 - WAL format: newline-terminated text headers (`SET <keylen> <vallen>\n` /
   `DEL <keylen>\n`) followed by raw key/value bytes, sized by length prefix
   rather than delimiter so values can contain arbitrary bytes including
