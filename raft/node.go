@@ -43,15 +43,16 @@ func randomElectionTimeout() time.Duration {
 }
 
 // Node holds one Raft node's role and state and is safe for concurrent use.
-// It has no background timer loop yet — that's still to come.
 type Node struct {
-	mu        sync.Mutex
-	id        string
-	peers     []string
-	role      Role
-	state     PersistentState
-	log       *Log
-	statePath string // empty means "in-memory only, don't persist" (see NewNode vs Open)
+	mu         sync.Mutex
+	id         string
+	peers      []string
+	role       Role
+	state      PersistentState
+	log        *Log
+	statePath  string // empty means "in-memory only, don't persist" (see NewNode vs Open)
+	resetTimer chan struct{}
+	stop       chan struct{}
 }
 
 // NewNode creates a Node starting as a Follower with an empty log and zero
@@ -60,7 +61,7 @@ type Node struct {
 // running node should use Open instead so votes and term changes survive a
 // crash.
 func NewNode(id string, peers []string) *Node {
-	return &Node{id: id, peers: peers, role: Follower, log: NewLog()}
+	return &Node{id: id, peers: peers, role: Follower, log: NewLog(), resetTimer: make(chan struct{}, 1), stop: make(chan struct{})}
 }
 
 // Open loads (or, on first run, initializes) a Node's persistent state from
@@ -72,7 +73,7 @@ func Open(id string, peers []string, statePath string) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Node{id: id, peers: peers, role: Follower, log: NewLog(), state: state, statePath: statePath}, nil
+	return &Node{id: id, peers: peers, role: Follower, log: NewLog(), state: state, statePath: statePath, resetTimer: make(chan struct{}, 1), stop: make(chan struct{})}, nil
 }
 
 // Role reports the node's current role.
@@ -92,14 +93,20 @@ type RequestVoteSender func(peer string, args RequestVoteArgs) (RequestVoteReply
 // runs the decision logic in HandleRequestVote under the node's lock and,
 // for a node opened with Open, durably saves any resulting state change
 // BEFORE returning — so the reply can be trusted even if the node crashes
-// immediately after sending it (see PersistentState). Its signature matches
-// RequestVoteHandler, so it can be passed directly to ListenAndServe, e.g.
-// ListenAndServe(addr, node.HandleRequestVoteRPC).
+// immediately after sending it (see PersistentState). If the request
+// reveals a higher term than the node knew about, the node also steps down
+// to Follower regardless of its previous role — a Leader or Candidate that
+// hasn't heard about a newer term yet must not keep acting like one once it
+// has. Its signature matches RequestVoteHandler, so it can be passed
+// directly to ListenAndServe, e.g. ListenAndServe(addr, node.HandleRequestVoteRPC).
 func (n *Node) HandleRequestVoteRPC(args RequestVoteArgs) RequestVoteReply {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
 	newState, reply := HandleRequestVote(n.state, n.log, args)
+	if newState.CurrentTerm > n.state.CurrentTerm {
+		n.role = Follower
+	}
 	if newState != n.state && n.statePath != "" {
 		if err := SaveState(n.statePath, newState); err != nil {
 			// Couldn't durably save the term bump or cast vote -- refuse
@@ -170,4 +177,50 @@ collectLoop:
 		}
 	}
 	return outcome
+}
+
+// ResetElectionTimer signals the background loop started by Run that a
+// legitimate heartbeat was received, so it restarts its timeout window
+// instead of starting a new election. It's safe to call whether or not Run
+// is currently active — a signal sent when nothing is listening is simply
+// dropped rather than blocking.
+func (n *Node) ResetElectionTimer() {
+	select {
+	case n.resetTimer <- struct{}{}:
+	default:
+	}
+}
+
+// Stop ends the background loop started by Run.
+func (n *Node) Stop() {
+	close(n.stop)
+}
+
+// Run is the node's background election timer loop: it waits for
+// nextTimeout() to elapse without being reset (via ResetElectionTimer),
+// then — unless the node is currently Leader — runs an election via send.
+// It blocks until Stop is called, so callers should run it in its own
+// goroutine. nextTimeout is normally randomElectionTimeout; tests can pass
+// a faster function to avoid waiting on real timeouts.
+//
+// A Leader deliberately never re-triggers its own election here: real Raft
+// has a Leader actively sending heartbeats on its own separate ticker
+// instead, which resets every Follower's timer — that heartbeat-sending
+// side doesn't exist yet (it's part of AppendEntries), so for now a Leader
+// simply idles rather than needlessly demoting itself.
+func (n *Node) Run(send RequestVoteSender, nextTimeout func() time.Duration) {
+	for {
+		timer := time.NewTimer(nextTimeout())
+		select {
+		case <-n.stop:
+			timer.Stop()
+			return
+		case <-n.resetTimer:
+			timer.Stop()
+		case <-timer.C:
+			if n.Role() != Leader {
+				n.RunElection(send, electionTimeoutMax)
+			}
+		}
+	}
 }

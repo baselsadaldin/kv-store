@@ -3,6 +3,7 @@ package raft
 import (
 	"errors"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -190,5 +191,117 @@ func TestRunElectionAbortsIfPersistFails(t *testing.T) {
 	}
 	if got := n.Role(); got != Follower {
 		t.Fatalf("Role() = %v, want Follower", got)
+	}
+}
+
+func TestHandleRequestVoteRPCStepsDownFromLeaderOnHigherTerm(t *testing.T) {
+	n := NewNode("node1", []string{"node2", "node3"})
+	n.role = Leader
+	n.state = PersistentState{CurrentTerm: 3}
+
+	reply := n.HandleRequestVoteRPC(RequestVoteArgs{Term: 4, CandidateID: "node2"})
+
+	if !reply.VoteGranted {
+		t.Fatal("expected vote to be granted")
+	}
+	if got := n.Role(); got != Follower {
+		t.Fatalf("Role() = %v, want Follower after seeing a higher term", got)
+	}
+}
+
+func fastTimeout(d time.Duration) func() time.Duration {
+	return func() time.Duration { return d }
+}
+
+func TestRunTriggersElectionOnTimeout(t *testing.T) {
+	n := NewNode("node1", []string{"node2", "node3"})
+	send := func(peer string, args RequestVoteArgs) (RequestVoteReply, error) {
+		return RequestVoteReply{Term: args.Term, VoteGranted: true}, nil
+	}
+
+	go n.Run(send, fastTimeout(10*time.Millisecond))
+	defer n.Stop()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if n.Role() == Leader {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("expected the node to become Leader via the election timer, but it never did")
+}
+
+func TestResetElectionTimerPreventsElection(t *testing.T) {
+	n := NewNode("node1", []string{"node2", "node3"})
+
+	var sent int32
+	send := func(peer string, args RequestVoteArgs) (RequestVoteReply, error) {
+		atomic.AddInt32(&sent, 1)
+		return RequestVoteReply{Term: args.Term, VoteGranted: true}, nil
+	}
+
+	go n.Run(send, fastTimeout(20*time.Millisecond))
+	defer n.Stop()
+
+	// Keep resetting faster than the timeout for a while; no election
+	// should ever get a chance to fire.
+	resetDeadline := time.Now().Add(150 * time.Millisecond)
+	for time.Now().Before(resetDeadline) {
+		n.ResetElectionTimer()
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if got := atomic.LoadInt32(&sent); got != 0 {
+		t.Fatalf("expected no election to run while resets kept arriving, but send was called %d time(s)", got)
+	}
+	if got := n.Role(); got != Follower {
+		t.Fatalf("Role() = %v, want Follower", got)
+	}
+}
+
+func TestRunDoesNotRestartElectionWhileLeader(t *testing.T) {
+	n := NewNode("node1", []string{"node2", "node3"})
+	send := func(peer string, args RequestVoteArgs) (RequestVoteReply, error) {
+		return RequestVoteReply{Term: args.Term, VoteGranted: true}, nil
+	}
+
+	go n.Run(send, fastTimeout(10*time.Millisecond))
+	defer n.Stop()
+
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) && n.Role() != Leader {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n.Role() != Leader {
+		t.Fatal("node never became Leader")
+	}
+
+	// Give the timer several more cycles to fire; role should stay Leader
+	// instead of re-electing itself away from it.
+	time.Sleep(100 * time.Millisecond)
+	if got := n.Role(); got != Leader {
+		t.Fatalf("Role() = %v, want Leader (should not re-trigger elections while already Leader)", got)
+	}
+}
+
+func TestStopEndsRunLoop(t *testing.T) {
+	n := NewNode("node1", nil)
+	send := func(peer string, args RequestVoteArgs) (RequestVoteReply, error) {
+		return RequestVoteReply{}, nil
+	}
+
+	done := make(chan struct{})
+	go func() {
+		n.Run(send, fastTimeout(10*time.Millisecond))
+		close(done)
+	}()
+
+	n.Stop()
+
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("Run did not return after Stop was called")
 	}
 }

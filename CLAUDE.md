@@ -55,12 +55,18 @@ together — `RunElection` fans a `RequestVote` out to peers via an injected
 `RequestVoteSender` (either a fake in tests or `DialRequestVote` for real),
 and `Open`/`HandleRequestVoteRPC` wire a node to a real state file on disk,
 enforcing "persist before you reply/send" so a crash can never cause a
-double vote in one term. Not yet built: the background timer loop that
-actually triggers elections during normal operation (so a live multi-node
-election doesn't run end-to-end yet), `AppendEntries`/log replication, and
-wiring committed entries through to `store.Set`/`store.Delete`.
+double vote in one term; and `Node.Run` is the background election-timeout
+loop (waits for a randomized timeout, starts an election unless reset via
+`ResetElectionTimer` or already `Leader`, stoppable via `Stop`).
+`HandleRequestVoteRPC` also steps a node down to Follower if an incoming
+request reveals a higher term, even from a stale Leader. Not yet built:
+`AppendEntries`/log replication (including the Leader's own heartbeat
+sending, which is what would call `ResetElectionTimer` on Followers in
+practice — so a live multi-node election doesn't fully settle into a
+stable Leader yet), and wiring committed entries through to
+`store.Set`/`store.Delete`.
 
-Next up: continuing stage 3 — the election timer loop, then `AppendEntries`.
+Next up: continuing stage 3 — `AppendEntries` and log replication.
 
 ## Conventions
 
