@@ -24,9 +24,8 @@ to demonstrate systems programming and distributed systems fundamentals.
 
 ## Status
 
-Stages 1-2 complete. Stage 3's consensus algorithm is functionally
-complete and proven end-to-end over real TCP; wiring it into `cmd/kvstore`
-as an actual runnable multi-node cluster is the remaining work.
+Stages 1-3 complete: the store is a real, runnable Raft cluster. Stage 4
+(observability, benchmarking, deployment polish) hasn't started.
 
 Stage 1: in-memory store with a write-ahead log for persistence: durable
 Set/Delete (fsync on every write), crash recovery from torn writes on
@@ -87,7 +86,14 @@ unit-testable in isolation before any TCP was involved.
     retrying an entry on failure rather than skipping it.
   - `Propose` appends a new command to the Leader's own log; the running
     replication loop picks it up and pushes it out from there.
-- **Proof it actually works together**:
+  - `WaitApplied` blocks a caller until a given log index has been applied
+    (or errors out on timeout or on losing leadership before that
+    happens); `Propose` also re-checks the commit index immediately after
+    appending, since the Leader's own log always counts toward a majority
+    on its own — otherwise a single-node cluster (no peers) would never
+    commit anything, since nothing would ever call the peer-driven commit
+    check in `replicatePeer`.
+- **Proof the algorithm actually works together**:
   `TestThreeNodeClusterElectsLeaderReplicatesAndApplies`
   (`cluster_test.go`) spins up three real `Node`s with real `Transport`s
   on loopback TCP, lets them elect a Leader purely through the background
@@ -95,16 +101,35 @@ unit-testable in isolation before any TCP was involved.
   write on whichever node won, and asserts it gets replicated, committed
   by majority, and applied on all three nodes' own state machines.
 
-Not yet built: wiring any of this into `cmd/kvstore` as an actual
-CLI-launchable multi-node process (a `--peers` flag, a real `store.Store`
-behind the `Applier`, a state-file path per node), and making
-`server.go`'s client-facing `SET`/`DELETE` go through `Node.Propose` (with
-a wait-for-commit step and a "not the Leader, redirect" response) instead
-of calling `store.Set` directly. Raft log compaction/snapshotting (the
-Raft-specific counterpart to `store`'s WAL compaction — the `Log` currently
-keeps every entry forever) is also still open.
+**Wired into `cmd/kvstore` for real use.** New flags: `--raft-addr`
+(this node's Raft RPC address — also doubles as its Raft node ID),
+`--raft-peers` (comma-separated `--raft-addr` values of the other nodes),
+`--raft-state` (where this node's term/vote persist). When `--raft-addr`
+is set, `main` opens a `raft.Node`, wires its `Applier` to
+`store.Set`/`store.Delete`, starts its `Transport`, runs it via
+`RunWithRealTiming`, and constructs the client-facing `server.Server` with
+`server.NewRaft` instead of `server.New` — which routes `SET`/`DELETE`
+through `Node.Propose` + `WaitApplied` (blocking until committed and
+applied, or erroring — including a plain "not the leader" error on a
+non-Leader node, since only the Leader accepts writes) instead of writing
+to `store` directly. `GET`/`KEYS`/`COMPACT` are unchanged either way —
+they always read/act on that node's own local store, so a Follower that
+hasn't caught up yet can return stale data for those; only `SET`/`DELETE`
+carry Raft's consistency guarantee. Manually verified end-to-end: a real
+3-node cluster elects a Leader, replicates a write to all three, and after
+killing the Leader process outright, the survivors elect a new Leader
+within a couple of election-timeout cycles and continue accepting writes
+without losing prior data.
 
-Next up: wiring stage 3 into `cmd/kvstore` for a real, runnable cluster.
+Still open, and each is a reasonable follow-up rather than a gap in the
+core algorithm: Raft log compaction/snapshotting (`Log` keeps every entry
+forever — no counterpart yet to `store`'s WAL compaction); dynamic cluster
+membership changes (the peer list is fixed at startup); and reads are only
+ever served from whichever node the client happens to be connected to,
+which is a deliberate, named simplification (eventual consistency for
+`GET`/`KEYS`, not linearizable) rather than an oversight — a real
+read-from-Leader or read-index scheme would be the next step if that
+mattered here.
 
 ## Conventions
 
@@ -132,7 +157,11 @@ Next up: wiring stage 3 into `cmd/kvstore` for a real, runnable cluster.
   dependencies (a network client, a `*store.Store`), so consensus logic is
   fully unit-testable with fakes — `DialRequestVote`/`DialAppendEntries`
   (real TCP) and a real `Applier` are only wired in where a `Node` is
-  actually run.
+  actually run (`cmd/kvstore/main.go` is that wiring point).
+- `server.New` (direct-to-store, stage 2 behavior) and `server.NewRaft`
+  (routes `SET`/`DELETE` through a `*raft.Node`) share the same `Server`
+  type and protocol — which constructor `cmd/kvstore` calls is decided
+  purely by whether `--raft-addr` was passed.
 - WAL format: newline-terminated text headers (`SET <keylen> <vallen>\n` /
   `DEL <keylen>\n`) followed by raw key/value bytes, sized by length prefix
   rather than delimiter so values can contain arbitrary bytes including

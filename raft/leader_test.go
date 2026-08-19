@@ -3,6 +3,7 @@ package raft
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestProposeAppendsToLeaderLog(t *testing.T) {
@@ -183,5 +184,58 @@ func TestAdvanceCommitIndexNeedsActualMajority(t *testing.T) {
 
 	if n.commitIndex != 0 {
 		t.Fatalf("commitIndex = %d, want 0 (2 of 4 is not a majority)", n.commitIndex)
+	}
+}
+
+func TestProposeCommitsImmediatelyForSingleNodeCluster(t *testing.T) {
+	n := newTestLeader("node1", nil, 1) // no peers: the Leader alone is a majority of one
+
+	var applied []Command
+	n.SetApplier(func(cmd Command) error {
+		applied = append(applied, cmd)
+		return nil
+	})
+
+	index, isLeader := n.Propose(Command{Op: "SET", Key: "foo", Value: "bar"})
+
+	if !isLeader {
+		t.Fatal("expected Propose to succeed")
+	}
+	if n.commitIndex != index {
+		t.Fatalf("commitIndex = %d, want %d (should commit immediately with no peers to wait on)", n.commitIndex, index)
+	}
+	if len(applied) != 1 || applied[0].Key != "foo" {
+		t.Fatalf("got applied %v, want the proposed command applied immediately", applied)
+	}
+}
+
+func TestWaitAppliedReturnsOnceApplied(t *testing.T) {
+	n := newTestLeader("node1", nil, 1)
+	n.SetApplier(func(Command) error { return nil })
+	index, _ := n.Propose(Command{Op: "SET", Key: "foo", Value: "bar"})
+
+	if err := n.WaitApplied(index, 50*time.Millisecond); err != nil {
+		t.Fatalf("WaitApplied failed: %v", err)
+	}
+}
+
+func TestWaitAppliedTimesOutIfNeverApplied(t *testing.T) {
+	n := newTestLeader("node1", []string{"node2"}, 1) // has a peer, so Propose alone won't reach majority
+	index, _ := n.Propose(Command{Op: "SET", Key: "foo", Value: "bar"})
+
+	err := n.WaitApplied(index, 30*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected WaitApplied to time out, got nil error")
+	}
+}
+
+func TestWaitAppliedReturnsErrorIfNoLongerLeader(t *testing.T) {
+	n := newTestLeader("node1", []string{"node2"}, 1)
+	index, _ := n.Propose(Command{Op: "SET", Key: "foo", Value: "bar"})
+	n.role = Follower // simulate stepping down before the entry committed
+
+	err := n.WaitApplied(index, 200*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected WaitApplied to report an error after losing leadership")
 	}
 }

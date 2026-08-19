@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"errors"
 	"math/rand"
 	"sync"
 	"time"
@@ -217,12 +218,17 @@ func (n *Node) applyCommittedLocked() {
 }
 
 // Propose appends command to the Leader's log as a new entry in its current
-// term. It does not wait for replication or commit — the background
-// replication loop (driven by Run while this node is Leader) picks it up
-// and pushes it out on its next tick. It returns the index the entry was
+// term. It does not wait for replication — the background replication loop
+// (driven by Run while this node is Leader) still does the actual work of
+// pushing it out to peers and retrying. It returns the index the entry was
 // assigned and whether this node is currently the Leader; if it isn't, the
 // command is not appended, and the caller (the client-facing handler)
 // should redirect elsewhere rather than treat this as accepted.
+//
+// It also immediately re-checks the commit index: the Leader's own log
+// always counts toward a majority, so for a single-node cluster (no peers)
+// this is what commits an entry at all, rather than waiting forever for a
+// replicatePeer call that has no peer to run against.
 func (n *Node) Propose(command Command) (index int, isLeader bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -230,7 +236,39 @@ func (n *Node) Propose(command Command) (index int, isLeader bool) {
 		return 0, false
 	}
 	entry := n.log.Append(n.state.CurrentTerm, command)
+	n.advanceCommitIndexLocked()
+	n.applyCommittedLocked()
 	return entry.Index, true
+}
+
+// waitAppliedPollInterval is how often WaitApplied re-checks progress.
+const waitAppliedPollInterval = 5 * time.Millisecond
+
+// WaitApplied blocks until the entry at index has been applied to the state
+// machine (i.e. lastApplied >= index), or returns an error if timeout
+// elapses first, or if this node stops being Leader before that happens —
+// in that case the entry may have been discarded by a later Leader (see
+// the safety discussion around uncommitted entries), so the caller should
+// treat the write as failed rather than assume it went through.
+func (n *Node) WaitApplied(index int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		n.mu.Lock()
+		applied := n.lastApplied >= index
+		stillLeader := n.role == Leader
+		n.mu.Unlock()
+
+		if applied {
+			return nil
+		}
+		if !stillLeader {
+			return errors.New("no longer leader: entry may not have committed")
+		}
+		if time.Now().After(deadline) {
+			return errors.New("timed out waiting for entry to be applied")
+		}
+		time.Sleep(waitAppliedPollInterval)
+	}
 }
 
 // AppendEntriesSender sends an AppendEntries RPC to peer and returns its
@@ -491,4 +529,13 @@ func (n *Node) Run(send RequestVoteSender, sendAppend AppendEntriesSender, nextT
 			}
 		}
 	}
+}
+
+// RunWithRealTiming starts Run using real, randomized election timeouts —
+// the production entry point for a live node. send and sendAppend should
+// normally be DialRequestVote and DialAppendEntries. Tests that need fast
+// or deterministic timing should call Run directly with a custom
+// nextTimeout instead.
+func (n *Node) RunWithRealTiming(send RequestVoteSender, sendAppend AppendEntriesSender) {
+	n.Run(send, sendAppend, randomElectionTimeout)
 }
