@@ -43,21 +43,36 @@ func randomElectionTimeout() time.Duration {
 }
 
 // Node holds one Raft node's role and state and is safe for concurrent use.
-// It has no networking of its own yet (see RequestVoteSender) and no
-// background timer loop yet — those are still to come.
+// It has no background timer loop yet — that's still to come.
 type Node struct {
-	mu    sync.Mutex
-	id    string
-	peers []string
-	role  Role
-	state PersistentState
-	log   *Log
+	mu        sync.Mutex
+	id        string
+	peers     []string
+	role      Role
+	state     PersistentState
+	log       *Log
+	statePath string // empty means "in-memory only, don't persist" (see NewNode vs Open)
 }
 
 // NewNode creates a Node starting as a Follower with an empty log and zero
-// persistent state.
+// persistent state, held in memory only — nothing is ever saved to disk.
+// This is meant for tests that only care about decision logic; a real,
+// running node should use Open instead so votes and term changes survive a
+// crash.
 func NewNode(id string, peers []string) *Node {
 	return &Node{id: id, peers: peers, role: Follower, log: NewLog()}
+}
+
+// Open loads (or, on first run, initializes) a Node's persistent state from
+// statePath, mirroring store.Open's role for the storage engine. The
+// returned Node persists its term and vote to statePath from then on,
+// before ever acting on them over the network.
+func Open(id string, peers []string, statePath string) (*Node, error) {
+	state, err := LoadState(statePath)
+	if err != nil {
+		return nil, err
+	}
+	return &Node{id: id, peers: peers, role: Follower, log: NewLog(), state: state, statePath: statePath}, nil
 }
 
 // Role reports the node's current role.
@@ -73,16 +88,50 @@ func (n *Node) Role() Role {
 // is a later step.
 type RequestVoteSender func(peer string, args RequestVoteArgs) (RequestVoteReply, error)
 
+// HandleRequestVoteRPC applies an incoming RequestVote RPC to the node: it
+// runs the decision logic in HandleRequestVote under the node's lock and,
+// for a node opened with Open, durably saves any resulting state change
+// BEFORE returning — so the reply can be trusted even if the node crashes
+// immediately after sending it (see PersistentState). Its signature matches
+// RequestVoteHandler, so it can be passed directly to ListenAndServe, e.g.
+// ListenAndServe(addr, node.HandleRequestVoteRPC).
+func (n *Node) HandleRequestVoteRPC(args RequestVoteArgs) RequestVoteReply {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	newState, reply := HandleRequestVote(n.state, n.log, args)
+	if newState != n.state && n.statePath != "" {
+		if err := SaveState(n.statePath, newState); err != nil {
+			// Couldn't durably save the term bump or cast vote -- refuse
+			// rather than risk the node forgetting it after a crash.
+			return RequestVoteReply{Term: n.state.CurrentTerm, VoteGranted: false}
+		}
+	}
+	n.state = newState
+	return reply
+}
+
 // RunElection drives one full election attempt: transitions the node to
-// Candidate, starts a new term (via StartElection), sends RequestVote to
-// every peer concurrently via send, waits up to timeout for replies,
-// tallies them (via CountVotes), and updates the node's role accordingly —
-// Leader on a majority, Follower otherwise (including on a stale-term
-// reply). It returns the outcome.
+// Candidate, starts a new term (via StartElection), persists the resulting
+// self-vote (for a node opened with Open), sends RequestVote to every peer
+// concurrently via send, waits up to timeout for replies, tallies them (via
+// CountVotes), and updates the node's role accordingly — Leader on a
+// majority, Follower otherwise (including on a stale-term reply, or if the
+// self-vote couldn't be durably saved). It returns the outcome.
 func (n *Node) RunElection(send RequestVoteSender, timeout time.Duration) VoteOutcome {
 	n.mu.Lock()
 	n.role = Candidate
 	newState, args := StartElection(n.state, n.log, n.id)
+	if n.statePath != "" {
+		if err := SaveState(n.statePath, newState); err != nil {
+			// Can't safely become a Candidate if the self-vote can't be
+			// persisted -- abort back to Follower rather than risk
+			// forgetting it after a crash.
+			n.role = Follower
+			n.mu.Unlock()
+			return Pending
+		}
+	}
 	n.state = newState
 	currentTerm := n.state.CurrentTerm
 	peers := append([]string(nil), n.peers...)

@@ -39,23 +39,28 @@ Server handles each connection on its own goroutine against one shared
 (SET/GET/DELETE/KEYS/COMPACT in, OK/VALUE/NIL/ERR/KEY.../END out).
 
 Stage 3 (in progress): Raft consensus, being built incrementally in a new
-`raft` package, deliberately kept independent of networking so each piece
-is unit-testable in isolation before any TCP is involved. So far:
-`PersistentState` (durable `currentTerm`/`votedFor`, same write-temp-file +
-atomic-rename crash safety as `store`'s log compaction); an in-memory `Log`
-of term-tagged entries (`Append`/`Get`/`LastIndex`/`LastTerm`/
-`TruncateFrom`); `HandleRequestVote` (the receiving side of an election —
-term/vote/log-up-to-date checks); `StartElection` and `CountVotes` (the
-candidate side — becoming a candidate and tallying replies); and `Node`,
-which ties those together into `RunElection` (fans a `RequestVote` out to
-peers via an injected `RequestVoteSender` function and transitions
-role/state on the result). Not yet built: real peer-to-peer transport (a
-separate port from the client protocol, using `encoding/gob` — decided but
-not implemented), the background timer loop that actually triggers
-elections during normal operation, `AppendEntries`/log replication, and
+`raft` package, deliberately kept independent of networking at first so
+each piece was unit-testable in isolation before any TCP was involved. So
+far: `PersistentState` (durable `currentTerm`/`votedFor`, same
+write-temp-file + atomic-rename crash safety as `store`'s log compaction);
+an in-memory `Log` of term-tagged entries (`Append`/`Get`/`LastIndex`/
+`LastTerm`/`TruncateFrom`); `HandleRequestVote` (the receiving side of an
+election — term/vote/log-up-to-date checks) and `StartElection`/
+`CountVotes` (the candidate side — becoming a candidate and tallying
+replies), all as pure, no-I/O functions; `Transport` (`ListenAndServe`/
+`DialRequestVote`), a real TCP listener on its own port speaking
+`encoding/gob`-encoded `RequestVoteArgs`/`RequestVoteReply`, one
+request/reply per connection; and `Node`, which ties all of the above
+together — `RunElection` fans a `RequestVote` out to peers via an injected
+`RequestVoteSender` (either a fake in tests or `DialRequestVote` for real),
+and `Open`/`HandleRequestVoteRPC` wire a node to a real state file on disk,
+enforcing "persist before you reply/send" so a crash can never cause a
+double vote in one term. Not yet built: the background timer loop that
+actually triggers elections during normal operation (so a live multi-node
+election doesn't run end-to-end yet), `AppendEntries`/log replication, and
 wiring committed entries through to `store.Set`/`store.Delete`.
 
-Next up: continuing stage 3 — transport, then `AppendEntries`.
+Next up: continuing stage 3 — the election timer loop, then `AppendEntries`.
 
 ## Conventions
 
