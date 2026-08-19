@@ -5,12 +5,22 @@ import (
 	"testing"
 )
 
-func TestDialRequestVoteRoundTrip(t *testing.T) {
-	handle := func(args RequestVoteArgs) RequestVoteReply {
-		return RequestVoteReply{Term: args.Term, VoteGranted: true}
+func testHandlers(voteHandle RequestVoteHandler, appendHandle AppendEntriesHandler) Handlers {
+	if voteHandle == nil {
+		voteHandle = func(RequestVoteArgs) RequestVoteReply { return RequestVoteReply{} }
 	}
+	if appendHandle == nil {
+		appendHandle = func(AppendEntriesArgs) AppendEntriesReply { return AppendEntriesReply{} }
+	}
+	return Handlers{RequestVote: voteHandle, AppendEntries: appendHandle}
+}
 
-	transport, err := ListenAndServe("127.0.0.1:0", handle)
+func TestDialRequestVoteRoundTrip(t *testing.T) {
+	handlers := testHandlers(func(args RequestVoteArgs) RequestVoteReply {
+		return RequestVoteReply{Term: args.Term, VoteGranted: true}
+	}, nil)
+
+	transport, err := ListenAndServe("127.0.0.1:0", handlers)
 	if err != nil {
 		t.Fatalf("ListenAndServe failed: %v", err)
 	}
@@ -36,12 +46,75 @@ func TestDialRequestVoteToUnreachablePeerReturnsError(t *testing.T) {
 	}
 }
 
-func TestListenAndServeHandlesConcurrentRequests(t *testing.T) {
-	handle := func(args RequestVoteArgs) RequestVoteReply {
-		return RequestVoteReply{Term: args.Term, VoteGranted: args.CandidateID == "winner"}
+func TestDialAppendEntriesRoundTrip(t *testing.T) {
+	handlers := testHandlers(nil, func(args AppendEntriesArgs) AppendEntriesReply {
+		return AppendEntriesReply{Term: args.Term, Success: true}
+	})
+
+	transport, err := ListenAndServe("127.0.0.1:0", handlers)
+	if err != nil {
+		t.Fatalf("ListenAndServe failed: %v", err)
+	}
+	defer transport.Close()
+
+	reply, err := DialAppendEntries(transport.listener.Addr().String(), AppendEntriesArgs{
+		Term: 3, LeaderID: "node1",
+	})
+	if err != nil {
+		t.Fatalf("DialAppendEntries failed: %v", err)
+	}
+	if reply.Term != 3 || !reply.Success {
+		t.Fatalf("got %+v, want {Term: 3, Success: true}", reply)
+	}
+}
+
+func TestDialAppendEntriesToUnreachablePeerReturnsError(t *testing.T) {
+	_, err := DialAppendEntries("127.0.0.1:1", AppendEntriesArgs{Term: 1})
+	if err == nil {
+		t.Fatal("expected an error dialing an unreachable peer, got nil")
+	}
+}
+
+func TestOnePortDispatchesBothRPCKindsCorrectly(t *testing.T) {
+	handlers := testHandlers(
+		func(args RequestVoteArgs) RequestVoteReply {
+			return RequestVoteReply{Term: args.Term, VoteGranted: true}
+		},
+		func(args AppendEntriesArgs) AppendEntriesReply {
+			return AppendEntriesReply{Term: args.Term, Success: true}
+		},
+	)
+
+	transport, err := ListenAndServe("127.0.0.1:0", handlers)
+	if err != nil {
+		t.Fatalf("ListenAndServe failed: %v", err)
+	}
+	defer transport.Close()
+	addr := transport.listener.Addr().String()
+
+	voteReply, err := DialRequestVote(addr, RequestVoteArgs{Term: 1, CandidateID: "node2"})
+	if err != nil {
+		t.Fatalf("DialRequestVote failed: %v", err)
+	}
+	if !voteReply.VoteGranted {
+		t.Fatal("expected the RequestVote handler to be the one that answered")
 	}
 
-	transport, err := ListenAndServe("127.0.0.1:0", handle)
+	appendReply, err := DialAppendEntries(addr, AppendEntriesArgs{Term: 1, LeaderID: "node2"})
+	if err != nil {
+		t.Fatalf("DialAppendEntries failed: %v", err)
+	}
+	if !appendReply.Success {
+		t.Fatal("expected the AppendEntries handler to be the one that answered")
+	}
+}
+
+func TestListenAndServeHandlesConcurrentRequests(t *testing.T) {
+	handlers := testHandlers(func(args RequestVoteArgs) RequestVoteReply {
+		return RequestVoteReply{Term: args.Term, VoteGranted: args.CandidateID == "winner"}
+	}, nil)
+
+	transport, err := ListenAndServe("127.0.0.1:0", handlers)
 	if err != nil {
 		t.Fatalf("ListenAndServe failed: %v", err)
 	}
@@ -67,11 +140,7 @@ func TestListenAndServeHandlesConcurrentRequests(t *testing.T) {
 }
 
 func TestCloseStopsAcceptingConnections(t *testing.T) {
-	handle := func(args RequestVoteArgs) RequestVoteReply {
-		return RequestVoteReply{Term: args.Term, VoteGranted: true}
-	}
-
-	transport, err := ListenAndServe("127.0.0.1:0", handle)
+	transport, err := ListenAndServe("127.0.0.1:0", testHandlers(nil, nil))
 	if err != nil {
 		t.Fatalf("ListenAndServe failed: %v", err)
 	}

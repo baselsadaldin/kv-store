@@ -56,6 +56,14 @@ type Node struct {
 	commitIndex int // highest log index known to be committed; volatile, rebuilt on restart, not persisted
 	lastApplied int // highest log index applied to the state machine via apply; volatile, always <= commitIndex
 	apply       Applier
+
+	// nextIndex and matchIndex are only meaningful while this node is
+	// Leader, reset each time it wins an election (see RunElection).
+	// nextIndex[peer] is this Leader's guess of the next log index peer
+	// needs; matchIndex[peer] is the highest index confirmed (by a
+	// successful reply) to actually be on peer's log.
+	nextIndex  map[string]int
+	matchIndex map[string]int
 }
 
 // Applier applies a committed command to the underlying state machine —
@@ -208,6 +216,160 @@ func (n *Node) applyCommittedLocked() {
 	}
 }
 
+// Propose appends command to the Leader's log as a new entry in its current
+// term. It does not wait for replication or commit — the background
+// replication loop (driven by Run while this node is Leader) picks it up
+// and pushes it out on its next tick. It returns the index the entry was
+// assigned and whether this node is currently the Leader; if it isn't, the
+// command is not appended, and the caller (the client-facing handler)
+// should redirect elsewhere rather than treat this as accepted.
+func (n *Node) Propose(command Command) (index int, isLeader bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.role != Leader {
+		return 0, false
+	}
+	entry := n.log.Append(n.state.CurrentTerm, command)
+	return entry.Index, true
+}
+
+// AppendEntriesSender sends an AppendEntries RPC to peer and returns its
+// reply. Same injection pattern as RequestVoteSender: a plain function
+// rather than a concrete network client, so replication logic is testable
+// without real networking; DialAppendEntries is the real implementation.
+type AppendEntriesSender func(peer string, args AppendEntriesArgs) (AppendEntriesReply, error)
+
+// heartbeatInterval is how often a Leader replicates to (or, if there's
+// nothing new, simply heartbeats) each peer. It must be well under
+// electionTimeoutMin so Followers reliably hear from a live Leader before
+// their own election timeout fires.
+const heartbeatInterval = 50 * time.Millisecond
+
+// replicateToAllPeers sends one round of AppendEntries to every peer,
+// concurrently, via send. It's a no-op if the node isn't currently Leader.
+func (n *Node) replicateToAllPeers(send AppendEntriesSender) {
+	n.mu.Lock()
+	if n.role != Leader {
+		n.mu.Unlock()
+		return
+	}
+	peers := append([]string(nil), n.peers...)
+	n.mu.Unlock()
+
+	var wg sync.WaitGroup
+	for _, peer := range peers {
+		wg.Add(1)
+		go func(peer string) {
+			defer wg.Done()
+			n.replicatePeer(peer, send)
+		}(peer)
+	}
+	wg.Wait()
+}
+
+// replicatePeer sends one AppendEntries to peer, covering everything from
+// nextIndex[peer] through the end of the Leader's log (empty Entries is a
+// pure heartbeat if peer is already caught up), and applies the reply:
+// stepping down if it reveals a higher term, advancing matchIndex/
+// nextIndex and re-checking the commit index on success, or backing
+// nextIndex up to retry further back on failure.
+func (n *Node) replicatePeer(peer string, send AppendEntriesSender) {
+	n.mu.Lock()
+	if n.role != Leader {
+		n.mu.Unlock()
+		return
+	}
+	next := max(n.nextIndex[peer], 1)
+	prevIndex := next - 1
+	prevTerm := 0
+	if prevIndex > 0 {
+		if e, ok := n.log.Get(prevIndex); ok {
+			prevTerm = e.Term
+		}
+	}
+	var entries []Entry
+	for i := next; i <= n.log.LastIndex(); i++ {
+		if e, ok := n.log.Get(i); ok {
+			entries = append(entries, e)
+		}
+	}
+	args := AppendEntriesArgs{
+		Term:         n.state.CurrentTerm,
+		LeaderID:     n.id,
+		PrevLogIndex: prevIndex,
+		PrevLogTerm:  prevTerm,
+		Entries:      entries,
+		LeaderCommit: n.commitIndex,
+	}
+	n.mu.Unlock()
+
+	reply, err := send(peer, args)
+	if err != nil {
+		return // peer unreachable this round; the next tick will retry
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.role != Leader {
+		return // stepped down while this RPC was in flight
+	}
+
+	if reply.Term > n.state.CurrentTerm {
+		// A peer knows about a later term -- this Leader is stale.
+		n.state.CurrentTerm = reply.Term
+		n.state.VotedFor = ""
+		if n.statePath != "" {
+			// Best-effort: even if this fails to persist, stepping down
+			// is still correct and safe (it can't cause a double vote).
+			SaveState(n.statePath, n.state)
+		}
+		n.role = Follower
+		return
+	}
+
+	if reply.Success {
+		n.matchIndex[peer] = prevIndex + len(entries)
+		n.nextIndex[peer] = n.matchIndex[peer] + 1
+		n.advanceCommitIndexLocked()
+		n.applyCommittedLocked()
+	} else if n.nextIndex[peer] > 1 {
+		n.nextIndex[peer]--
+	}
+}
+
+// advanceCommitIndexLocked recomputes commitIndex as the highest log index
+// present on a majority of the cluster (this Leader included), subject to
+// Raft's current-term-only commit rule: an index only counts if the entry
+// there was proposed in this Leader's own current term. Entries from
+// earlier terms become committed only indirectly, as a side effect of a
+// later current-term entry committing (see the Figure-8-style scenario
+// this rule closes). The caller must hold n.mu and only call this while
+// Leader.
+func (n *Node) advanceCommitIndexLocked() {
+	matchIndexes := make([]int, 0, len(n.peers)+1)
+	matchIndexes = append(matchIndexes, n.log.LastIndex()) // the Leader always has its own entire log
+	for _, peer := range n.peers {
+		matchIndexes = append(matchIndexes, n.matchIndex[peer])
+	}
+	majority := len(matchIndexes)/2 + 1
+
+	for idx := n.log.LastIndex(); idx > n.commitIndex; idx-- {
+		count := 0
+		for _, mi := range matchIndexes {
+			if mi >= idx {
+				count++
+			}
+		}
+		if count < majority {
+			continue
+		}
+		if entry, ok := n.log.Get(idx); ok && entry.Term == n.state.CurrentTerm {
+			n.commitIndex = idx
+			return
+		}
+	}
+}
+
 // RunElection drives one full election attempt: transitions the node to
 // Candidate, starts a new term (via StartElection), persists the resulting
 // self-vote (for a node opened with Open), sends RequestVote to every peer
@@ -262,6 +424,14 @@ collectLoop:
 	if n.role == Candidate {
 		if outcome == Won {
 			n.role = Leader
+			n.nextIndex = make(map[string]int, len(n.peers))
+			n.matchIndex = make(map[string]int, len(n.peers))
+			for _, peer := range n.peers {
+				// Optimistically assume every peer is fully caught up
+				// until an AppendEntries reply proves otherwise.
+				n.nextIndex[peer] = n.log.LastIndex() + 1
+				n.matchIndex[peer] = 0
+			}
 		} else {
 			n.role = Follower
 		}
@@ -286,20 +456,28 @@ func (n *Node) Stop() {
 	close(n.stop)
 }
 
-// Run is the node's background election timer loop: it waits for
-// nextTimeout() to elapse without being reset (via ResetElectionTimer),
-// then — unless the node is currently Leader — runs an election via send.
-// It blocks until Stop is called, so callers should run it in its own
-// goroutine. nextTimeout is normally randomElectionTimeout; tests can pass
-// a faster function to avoid waiting on real timeouts.
-//
-// A Leader deliberately never re-triggers its own election here: real Raft
-// has a Leader actively sending heartbeats on its own separate ticker
-// instead, which resets every Follower's timer — that heartbeat-sending
-// side doesn't exist yet (it's part of AppendEntries), so for now a Leader
-// simply idles rather than needlessly demoting itself.
-func (n *Node) Run(send RequestVoteSender, nextTimeout func() time.Duration) {
+// Run is the node's background loop, in one of two modes depending on
+// role. As Leader, it repeatedly calls replicateToAllPeers every
+// heartbeatInterval via sendAppend — this is what actually keeps the
+// cluster alive: it's the Leader's heartbeats that call
+// ResetElectionTimer on every Follower (via their HandleAppendEntriesRPC),
+// which is what stops them from timing out and calling needless elections.
+// As Follower or Candidate, it waits for nextTimeout() to elapse without
+// being reset, then runs an election via send. It blocks until Stop is
+// called, so callers should run it in its own goroutine. nextTimeout is
+// normally randomElectionTimeout; tests can pass a faster function.
+func (n *Node) Run(send RequestVoteSender, sendAppend AppendEntriesSender, nextTimeout func() time.Duration) {
 	for {
+		if n.Role() == Leader {
+			n.replicateToAllPeers(sendAppend)
+			select {
+			case <-n.stop:
+				return
+			case <-time.After(heartbeatInterval):
+			}
+			continue
+		}
+
 		timer := time.NewTimer(nextTimeout())
 		select {
 		case <-n.stop:

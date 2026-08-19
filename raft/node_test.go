@@ -213,13 +213,19 @@ func fastTimeout(d time.Duration) func() time.Duration {
 	return func() time.Duration { return d }
 }
 
+// noopAppendSender stands in for real AppendEntries transport in tests
+// that only care about election-timer behavior, not replication.
+func noopAppendSender(peer string, args AppendEntriesArgs) (AppendEntriesReply, error) {
+	return AppendEntriesReply{}, errors.New("no transport in this test")
+}
+
 func TestRunTriggersElectionOnTimeout(t *testing.T) {
 	n := NewNode("node1", []string{"node2", "node3"})
 	send := func(peer string, args RequestVoteArgs) (RequestVoteReply, error) {
 		return RequestVoteReply{Term: args.Term, VoteGranted: true}, nil
 	}
 
-	go n.Run(send, fastTimeout(10*time.Millisecond))
+	go n.Run(send, noopAppendSender, fastTimeout(10*time.Millisecond))
 	defer n.Stop()
 
 	deadline := time.Now().Add(500 * time.Millisecond)
@@ -241,7 +247,7 @@ func TestResetElectionTimerPreventsElection(t *testing.T) {
 		return RequestVoteReply{Term: args.Term, VoteGranted: true}, nil
 	}
 
-	go n.Run(send, fastTimeout(20*time.Millisecond))
+	go n.Run(send, noopAppendSender, fastTimeout(20*time.Millisecond))
 	defer n.Stop()
 
 	// Keep resetting faster than the timeout for a while; no election
@@ -266,7 +272,7 @@ func TestRunDoesNotRestartElectionWhileLeader(t *testing.T) {
 		return RequestVoteReply{Term: args.Term, VoteGranted: true}, nil
 	}
 
-	go n.Run(send, fastTimeout(10*time.Millisecond))
+	go n.Run(send, noopAppendSender, fastTimeout(10*time.Millisecond))
 	defer n.Stop()
 
 	deadline := time.Now().Add(200 * time.Millisecond)
@@ -293,7 +299,7 @@ func TestStopEndsRunLoop(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		n.Run(send, fastTimeout(10*time.Millisecond))
+		n.Run(send, noopAppendSender, fastTimeout(10*time.Millisecond))
 		close(done)
 	}()
 
@@ -345,7 +351,7 @@ func TestHandleAppendEntriesRPCResetsElectionTimer(t *testing.T) {
 		return RequestVoteReply{Term: args.Term, VoteGranted: true}, nil
 	}
 
-	go n.Run(send, fastTimeout(20*time.Millisecond))
+	go n.Run(send, noopAppendSender, fastTimeout(20*time.Millisecond))
 	defer n.Stop()
 
 	// Keep "heartbeating" faster than the timeout; no election should ever
